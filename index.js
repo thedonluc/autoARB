@@ -3,10 +3,10 @@
  * WEEV2 ARB MONITOR - RAILWAY CRON SERVICE
  * ====================================================================
  * 
- * Polls ARBContract.getArbInfo() every 10 seconds.
- * If an arb opportunity exists (gap >= 2%), calls WWMM.keeperTrigger()
+ * Polls ARBContract.checkArbOpportunity() every 10 seconds.
+ * If an arb opportunity exists (gap >= 2.1%), calls WWMM.forceSync()
  * 
- * This is a BACKUP for the piggyback system - catches missed opportunities.
+ * This is a BACKUP keeper - catches missed opportunities between tax-triggered arbs.
  * 
  * Cost estimate:
  * - Reads: FREE (no gas, just RPC calls)
@@ -37,14 +37,13 @@ const MIN_ETH_BALANCE = ethers.utils.parseEther('0.001');
 
 // ====== ABIs ======
 const ARB_ABI = [
-    "function getArbInfo() external view returns (bool available, bool wethPoolExpensive, uint256 optimalAmount)",
+    "function checkArbOpportunity() external view returns (bool available, uint256 gapBps, bool wethPoolExpensive)",
     "function gapThresholdBps() external view returns (uint256)"
 ];
 
 const WWMM_ABI = [
-    "function keeperTrigger() external",
-    "function keepers(address) external view returns (bool)",
-    "function paused() external view returns (bool)"
+    "function forceSync() external",
+    "function arbEnabled() external view returns (bool)"
 ];
 
 // ====== STATE ======
@@ -63,8 +62,8 @@ function log(msg) {
 
 async function checkAndTriggerArb() {
     try {
-        // 1. Check if arb opportunity exists
-        const [available, wethPoolExpensive, optimalAmount] = await arbContract.getArbInfo();
+        // 1. Check if arb opportunity exists using checkArbOpportunity
+        const [available, gapBps, wethPoolExpensive] = await arbContract.checkArbOpportunity();
 
         if (!available) {
             // No opportunity - silent (don't spam logs)
@@ -72,41 +71,33 @@ async function checkAndTriggerArb() {
         }
 
         // 2. Log the opportunity
-        const amountFormatted = ethers.utils.formatEther(optimalAmount);
         const direction = wethPoolExpensive ? 'WETH→SOL' : 'SOL→WETH';
-        log(`🎯 ARB OPPORTUNITY: ${direction}, ${amountFormatted} tokens`);
+        log(`🎯 ARB OPPORTUNITY: ${direction}, Gap: ${gapBps.toString()} bps (${(gapBps.toNumber() / 100).toFixed(2)}%)`);
 
-        // 3. Check if WWMM is paused
-        const isPaused = await wwmmContract.paused();
-        if (isPaused) {
-            log(`⚠️ WWMM is paused, skipping`);
-            return { triggered: false, reason: 'wwmm_paused' };
+        // 3. Check if ARB is enabled on WWMM
+        const arbEnabled = await wwmmContract.arbEnabled();
+        if (!arbEnabled) {
+            log(`⚠️ ARB is disabled on WWMM, skipping`);
+            return { triggered: false, reason: 'arb_disabled' };
         }
 
-        // 4. Check if we're an authorized keeper
-        const isKeeper = await wwmmContract.keepers(wallet.address);
-        if (!isKeeper) {
-            log(`❌ Wallet ${wallet.address} is not an authorized keeper`);
-            return { triggered: false, reason: 'not_keeper' };
-        }
-
-        // 5. Check ETH balance
+        // 4. Check ETH balance
         const balance = await provider.getBalance(wallet.address);
         if (balance.lt(MIN_ETH_BALANCE)) {
             log(`❌ Low ETH balance: ${ethers.utils.formatEther(balance)}`);
             return { triggered: false, reason: 'low_balance' };
         }
 
-        // 6. Execute the arb via keeperTrigger
-        log(`🚀 Triggering arb...`);
-        const tx = await wwmmContract.keeperTrigger({
-            gasLimit: 800000  // Should be enough for 4-hop arb
+        // 5. Execute the arb via forceSync
+        log(`🚀 Triggering arb via forceSync...`);
+        const tx = await wwmmContract.forceSync({
+            gasLimit: 1200000  // FIX #12: 800K was too low, tradePistol alone uses ~757K
         });
 
         log(`📤 TX sent: ${tx.hash}`);
         const receipt = await tx.wait();
 
-        // 7. Update stats
+        // 6. Update stats
         totalArbs++;
         totalGasUsed = totalGasUsed.add(receipt.gasUsed.mul(receipt.effectiveGasPrice));
         lastArbTime = Date.now();
@@ -116,9 +107,9 @@ async function checkAndTriggerArb() {
         return { triggered: true, txHash: tx.hash };
 
     } catch (error) {
-        // Check if it's a "Cycle not complete" or similar expected error
+        // Check if it's a "No arb opportunity" or similar expected error
         const reason = error.reason || error.message;
-        if (reason.includes('No arb opportunity') || reason.includes('Gap below threshold')) {
+        if (reason.includes('No arb opportunity') || reason.includes('Gap below threshold') || reason.includes('no opportunity')) {
             // Expected - opportunity closed between check and execute
             return { triggered: false, reason: 'opportunity_closed' };
         }
@@ -141,13 +132,13 @@ async function runLoop() {
     const balance = await provider.getBalance(wallet.address);
     log(`Wallet Balance: ${ethers.utils.formatEther(balance)} ETH`);
 
-    // Check if authorized
-    const isKeeper = await wwmmContract.keepers(wallet.address);
-    if (!isKeeper) {
-        log(`\n⚠️ WARNING: Wallet is NOT an authorized keeper!`);
-        log(`Run: wwmmContract.setKeeper("${wallet.address}", true)`);
+    // Check if ARB is enabled
+    const arbEnabled = await wwmmContract.arbEnabled();
+    if (!arbEnabled) {
+        log(`\n⚠️ WARNING: ARB is disabled on WWMM!`);
+        log(`Run: wwmmContract.setArbEnabled(true)`);
     } else {
-        log(`✅ Wallet is authorized keeper`);
+        log(`✅ ARB is enabled on WWMM`);
     }
 
     // Get threshold
