@@ -5,9 +5,10 @@
  * 
  * Checks ARBContract.checkArbOpportunity() ONCE per invocation.
  * If an arb opportunity exists (gap >= 2.1%), calls WWMM.forceSync()
- * Then exits. Designed to be called every 1 minute via Railway cron.
+ * Then exits. Designed to be called every 5 minutes via Railway cron.
  * 
- * Railway hours: ~12h/month (runs for seconds each minute)
+ * Railway cron: */5 * * * *
+ * Railway hours: ~1.5h/month (runs for seconds every 5 min)
  * 
  * ====================================================================
  */
